@@ -1082,3 +1082,327 @@ select
 from dws_trade_activity_order_nd
 where dt='2020-06-14';
 ```
+
+## ADS层-ads_daily_channel_statistics(每日各渠道的统计数据）
+
+1）建表语句
+
+```sql
+DROP TABLE IF EXISTS ads_daily_channel_statistics;
+CREATE EXTERNAL TABLE ads_daily_channel_statistics
+(
+    `dt`               STRING COMMENT '统计日期',
+    `recent_days`      BIGINT COMMENT '最近天数,1:最近1天,7:最近7天,30:最近30天',
+    `channel`          STRING COMMENT '渠道',
+    `uv_count`         BIGINT COMMENT '访客人数',
+    `avg_duration_sec` BIGINT COMMENT '会话平均停留时长，单位为秒',
+    `avg_page_count`   BIGINT COMMENT '会话平均浏览页面数',
+    `sv_count`         BIGINT COMMENT '会话数',
+    `bounce_rate`      DECIMAL(16, 2) COMMENT '跳出率'
+) COMMENT '各渠道流量统计'
+    ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+    LOCATION '/warehouse/gmall/ads/ads_daily_channel_statistics/';
+```
+
+2）数据装载
+
+```sql
+insert overwrite table ads_daily_channel_statistics
+select * from ads_daily_channel_statistics
+union
+select
+    '2020-06-14' dt,
+    recent_days,
+    channel,
+    cast(count(distinct(mid_id)) as bigint) uv_count,
+    cast(avg(during_time_1d)/1000 as bigint) avg_duration_sec,
+    cast(avg(page_count_1d) as bigint) avg_page_count,
+    cast(count(*) as bigint) sv_count,
+    cast(sum(if(page_count_1d=1,1,0))/count(*) as decimal(16,2)) bounce_rate
+from dws_traffic_session_page_view_1d lateral view explode(array(1,7,30)) tmp as recent_days
+where dt>=date_add('2020-06-14',-recent_days+1)
+group by recent_days,channel;
+```
+
+## ADS层-ads_daily_user_statistics(每日用户的统计数据）
+
+主要属性有流失用户数，回流用户数，新增用户数，活跃用户数
+
+1）建表语句
+
+```sql
+DROP TABLE IF EXISTS ads_daily_user_statistics;
+CREATE EXTERNAL TABLE ads_daily_user_statistics
+(
+    `dt`               STRING COMMENT '统计日期',
+    `user_churn_count` BIGINT COMMENT '流失用户数',
+    `user_back_count`  BIGINT COMMENT '回流用户数',
+    `new_user_count`    BIGINT COMMENT '新增用户数',
+    `active_user_count` BIGINT COMMENT '活跃用户数'
+) COMMENT '用户变动统计'
+    ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+    LOCATION '/warehouse/gmall/ads/ads_daily_user_statistics/';
+```
+
+2）数据装载
+
+```sql
+insert overwrite table ads_daily_user_statistics
+select * from ads_daily_user_statistics
+union
+select
+    churn.dt,
+    user_churn_count,
+    user_back_count,
+    new_user_count,
+    active_user_count
+from
+(
+    select
+        '2020-06-14' dt,
+        count(*) user_churn_count
+    from dws_user_user_login_td
+    where dt='2020-06-14'
+    and login_date_last=date_add('2020-06-14',-7)
+)churn
+join
+(
+    select
+        '2020-06-14' dt,
+        count(*) user_back_count
+    from
+    (
+        select
+            user_id,
+            login_date_last
+        from dws_user_user_login_td
+        where dt='2020-06-14'
+    )t1
+    join
+    (
+        select
+            user_id,
+            login_date_last login_date_previous
+        from dws_user_user_login_td
+        where dt=date_add('2020-06-14',-1)
+    )t2
+    on t1.user_id=t2.user_id
+    where datediff(login_date_last,login_date_previous)>=8
+)back
+join
+(
+    select
+        sum(if(date_id>=date_add('2020-06-14',0),1,0)) active_user_count
+    from dwd_user_register_inc lateral
+    where dt='2020-06-14'
+)newuser
+join
+(
+    select
+        sum(if(login_date_last>=date_add('2020-06-14',0),1,0) new_user_count
+    from dws_user_user_login_td lateral
+    where dt='2020-06-14'
+)
+on churn.dt=back.dt;
+```
+
+## ADS层-ads_daily_order_statistics(每日订单的统计数据）
+
+```sql
+DROP TABLE IF EXISTS ads_daily_order_statistics;
+CREATE EXTERNAL TABLE ads_daily_order_statistics
+(
+    `dt`                      STRING COMMENT '统计日期',
+    `recent_days`             BIGINT COMMENT '最近天数,1:最近1天,7:最近7天,30:最近30天',
+    `tm_id`                   STRING COMMENT '品牌ID',
+    `tm_name`                 STRING COMMENT '品牌名称',
+    `order_count`             BIGINT COMMENT '订单数',
+    `order_user_count`        BIGINT COMMENT '订单人数',
+    `order_refund_count`      BIGINT COMMENT '退单数',
+    `order_refund_user_count` BIGINT COMMENT '退单人数'
+) COMMENT '各品牌商品交易统计'
+    ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+    LOCATION '/warehouse/gmall/ads/ads_daily_order_statistics/';
+```
+
+```sql
+insert overwrite table ads_daily_order_statistics
+select * from ads_daily_order_statistics
+union
+select
+    '2020-06-14' dt,
+    nvl(odr.recent_days,refund.recent_days),
+    nvl(odr.tm_id,refund.tm_id),
+    nvl(odr.tm_name,refund.tm_name),
+    nvl(order_count,0),
+    nvl(order_user_count,0),
+    nvl(order_refund_count,0),
+    nvl(order_refund_user_count,0)
+from
+(
+    select
+        1 recent_days,
+        tm_id,
+        tm_name,
+        sum(order_count_1d) order_count,
+        count(distinct(user_id)) order_user_count
+    from dws_trade_user_sku_order_1d
+    where dt='2020-06-14'
+    group by tm_id,tm_name
+    union all
+    select
+        recent_days,
+        tm_id,
+        tm_name,
+        sum(order_count),
+        count(distinct(if(order_count>0,user_id,null)))
+    from
+    (
+        select
+            recent_days,
+            user_id,
+            tm_id,
+            tm_name,
+            case recent_days
+                when 7 then order_count_7d
+                when 30 then order_count_30d
+            end order_count
+        from dws_trade_user_sku_order_nd lateral view explode(array(7,30)) tmp as recent_days
+        where dt='2020-06-14'
+    )t1
+    group by recent_days,tm_id,tm_name
+)odr
+full outer join
+(
+    select
+        1 recent_days,
+        tm_id,
+        tm_name,
+        sum(order_refund_count_1d) order_refund_count,
+        count(distinct(user_id)) order_refund_user_count
+    from dws_trade_user_sku_order_refund_1d
+    where dt='2020-06-14'
+    group by tm_id,tm_name
+    union all
+    select
+        recent_days,
+        tm_id,
+        tm_name,
+        sum(order_refund_count),
+        count(if(order_refund_count>0,user_id,null))
+    from
+    (
+        select
+            recent_days,
+            user_id,
+            tm_id,
+            tm_name,
+            case recent_days
+                when 7 then order_refund_count_7d
+                when 30 then order_refund_count_30d
+            end order_refund_count
+        from dws_trade_user_sku_order_refund_nd lateral view explode(array(7,30)) tmp as recent_days
+        where dt='2020-06-14'
+    )t1
+    group by recent_days,tm_id,tm_name
+)refund
+on odr.recent_days=refund.recent_days
+and odr.tm_id=refund.tm_id
+and odr.tm_name=refund.tm_name;
+```
+
+## ADS层-ads_daily_sku_statistics(每日商品的统计数据）
+
+1）建表语句
+
+```sql
+DROP TABLE IF EXISTS ads_daily_sku_statistics;
+CREATE EXTERNAL TABLE ads_daily_sku_statistics
+(
+    `dt`                      STRING COMMENT '统计日期',
+    `recent_days`             BIGINT COMMENT '最近天数,1:最近1日,7:最近7天,30:最近30天',
+    `order_total_amount`      DECIMAL(16, 2) COMMENT '订单总额,GMV',
+    `order_count`             BIGINT COMMENT '订单数',
+    `order_user_count`        BIGINT COMMENT '下单人数',
+    `order_refund_count`      BIGINT COMMENT '退单数',
+    `order_refund_user_count` BIGINT COMMENT '退单人数'
+) COMMENT '交易统计'
+    ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+    LOCATION '/warehouse/gmall/ads/ads_daily_sku_statistics/';
+```
+
+2）数据装载
+
+```sql
+insert overwrite table ads_daily_sku_statistics
+select * from ads_daily_sku_statistics
+union
+select
+    '2020-06-14',
+    odr.recent_days,
+    order_total_amount,
+    order_count,
+    order_user_count,
+    order_refund_count,
+    order_refund_user_count
+from
+(
+    select
+        1 recent_days,
+        sum(order_total_amount_1d) order_total_amount,
+        sum(order_count_1d) order_count,
+        count(*) order_user_count
+    from dws_trade_user_order_1d
+    where dt='2020-06-14'
+    union all
+    select
+        recent_days,
+        sum(order_total_amount),
+        sum(order_count),
+        sum(if(order_count>0,1,0))
+    from
+    (
+        select
+            recent_days,
+            case recent_days
+                when 7 then order_total_amount_7d
+                when 30 then order_total_amount_30d
+            end order_total_amount,
+            case recent_days
+                when 7 then order_count_7d
+                when 30 then order_count_30d
+            end order_count
+        from dws_trade_user_order_nd lateral view explode(array(7,30)) tmp as recent_days
+        where dt='2020-06-14'
+    )t1
+    group by recent_days
+)odr
+join
+(
+    select
+        1 recent_days,
+        sum(order_refund_count_1d) order_refund_count,
+        count(*) order_refund_user_count
+    from dws_trade_user_order_refund_1d
+    where dt='2020-06-14'
+    union all
+    select
+        recent_days,
+        sum(order_refund_count),
+        sum(if(order_refund_count>0,1,0))
+    from
+    (
+        select
+            recent_days,
+            case recent_days
+                when 7 then order_refund_count_7d
+                when 30 then order_refund_count_30d
+            end order_refund_count
+        from dws_trade_user_order_refund_nd lateral view explode(array(7,30)) tmp as recent_days
+        where dt='2020-06-14'
+    )t1
+    group by recent_days
+)refund
+on odr.recent_days=refund.recent_days;
+```
+
